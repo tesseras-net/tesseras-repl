@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
+use indicatif::{ProgressBar, ProgressStyle};
 use rusqlite::{Connection, params};
 use rustyline::completion::{Completer, FilenameCompleter, Pair};
 use rustyline::error::ReadlineError;
@@ -21,6 +22,7 @@ use rustyline::{
     CompletionType, Config, Context, Editor, ExternalPrinter, Helper,
 };
 use tesseras_dht::prelude::*;
+use tokio::sync::mpsc;
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::fmt::time::FormatTime;
 
@@ -29,8 +31,24 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Timeout for DHT network operations (store/retrieve).
 const DHT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Maximum content size for store operations (1 MiB).
+/// Maximum content size for inline store operations (1 MiB).
 const MAX_CONTENT_SIZE: usize = 1024 * 1024;
+
+/// Maximum file size for `put --file` operations (64 MiB).
+const MAX_FILE_SIZE: usize = 64 * 1024 * 1024;
+
+/// Adaptive timeout based on data size: 30s base + 2s per 256 KiB block, max 600s.
+fn store_timeout(data_len: usize) -> Duration {
+    let num_blocks = data_len.div_ceil(DEFAULT_BLOCK_SIZE);
+    let secs = 30 + num_blocks as u64 * 2;
+    Duration::from_secs(secs.min(600))
+}
+
+/// Adaptive timeout for retrieval based on chunk count: 30s base + 1s per chunk, max 600s.
+fn retrieve_timeout(num_chunks: usize) -> Duration {
+    let secs = 30 + num_chunks as u64;
+    Duration::from_secs(secs.min(600))
+}
 
 const BANNER_LINES: &[&str] = &[
     r"████████╗███████╗███████╗███████╗███████╗██████╗  █████╗ ███████╗",
@@ -239,10 +257,14 @@ fn format_utc_now() -> String {
     format!("{y:04}-{mo:02}-{d:02} {h:02}:{m:02}")
 }
 
+/// Default listen port for the REPL node.
+const DEFAULT_PORT: u16 = 4433;
+
 struct CliOpts {
     bind_addr: Option<SocketAddr>,
+    port: u16,
     ipv4_only: bool,
-    ipv6_only: bool,
+    data_dir: Option<PathBuf>,
 }
 
 /// Parse `-a ip[@port]` into a SocketAddr.
@@ -273,6 +295,13 @@ fn parse_args() -> Result<CliOpts> {
     opts.optflag("h", "help", "Print help information and exit");
     opts.optflag("v", "version", "Print version and exit");
     opts.optopt("a", "address", "Listen address ip[@port]", "ADDR");
+    opts.optopt("D", "datadir", "Data directory", "DIR");
+    opts.optopt(
+        "p",
+        "port",
+        &format!("Listen port (default: {DEFAULT_PORT})"),
+        "PORT",
+    );
 
     let matches = opts.parse(&args[1..]).map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -295,10 +324,26 @@ fn parse_args() -> Result<CliOpts> {
 
     let bind_addr = matches.opt_str("a").map(|s| parse_addr(&s)).transpose()?;
 
+    let port = matches
+        .opt_str("p")
+        .map(|s| {
+            s.parse::<u16>()
+                .map_err(|e| anyhow::anyhow!("bad port '{s}': {e}"))
+        })
+        .transpose()?
+        .unwrap_or(DEFAULT_PORT);
+
+    if bind_addr.is_some() && matches.opt_present("p") {
+        anyhow::bail!("-a and -p are mutually exclusive (use -a ip@port)");
+    }
+
+    let data_dir = matches.opt_str("D").map(PathBuf::from);
+
     Ok(CliOpts {
         bind_addr,
+        port,
         ipv4_only,
-        ipv6_only,
+        data_dir,
     })
 }
 
@@ -725,67 +770,255 @@ async fn handle_command(state: &mut ReplState, line: &str) -> Result<bool> {
     match cmd {
         "put" => {
             let (alias, content) = parse_name_flag(arg);
-            if content.is_empty() {
-                println!("usage: put [--name <alias>] <content>");
-                return Ok(true);
-            }
-            if content.len() > MAX_CONTENT_SIZE {
-                eprintln!(
-                    "error: content too large ({} bytes, max {})",
-                    content.len(),
-                    MAX_CONTENT_SIZE
-                );
-                return Ok(true);
-            }
+
+            // Check for --file flag in content
+            let (data, is_file) = if let Some(file_path) =
+                content.strip_prefix("--file ")
+            {
+                let file_path = file_path.trim();
+                if file_path.is_empty() {
+                    println!("usage: put [--name <alias>] --file <path>");
+                    return Ok(true);
+                }
+                match tokio::fs::read(file_path).await {
+                    Ok(data) => {
+                        if data.len() > MAX_FILE_SIZE {
+                            eprintln!(
+                                "error: file too large ({} bytes, max {})",
+                                data.len(),
+                                MAX_FILE_SIZE
+                            );
+                            return Ok(true);
+                        }
+                        (data, true)
+                    }
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        return Ok(true);
+                    }
+                }
+            } else {
+                if content.is_empty() {
+                    println!(
+                        "usage: put [--name <alias>] [--file <path> | <content>]"
+                    );
+                    return Ok(true);
+                }
+                if content.len() > MAX_CONTENT_SIZE {
+                    eprintln!(
+                        "error: content too large ({} bytes, max {})",
+                        content.len(),
+                        MAX_CONTENT_SIZE
+                    );
+                    return Ok(true);
+                }
+                (content.as_bytes().to_vec(), false)
+            };
+
             if let Some(ref a) = alias
                 && state.entries.iter().any(|e| e.alias.as_deref() == Some(a))
             {
                 eprintln!("error: alias '{a}' already exists");
                 return Ok(true);
             }
-            match tokio::time::timeout(
-                DHT_TIMEOUT,
-                state.node.store(content.as_bytes()),
-            )
-            .await
-            {
-                Ok(Ok(result)) => {
-                    let token = result.to_string();
-                    println!("{token}");
-                    state.save_token(token, alias.as_deref());
+
+            let timeout = store_timeout(data.len());
+            let num_blocks = data.len().div_ceil(DEFAULT_BLOCK_SIZE).max(1);
+            eprintln!(
+                "storing {} bytes ({} block{}, timeout={}s)...",
+                data.len(),
+                num_blocks,
+                if num_blocks == 1 { "" } else { "s" },
+                timeout.as_secs()
+            );
+            let store_start = std::time::Instant::now();
+
+            if is_file {
+                // Use progress reporting for multi-block file stores
+                let (progress_tx, mut progress_rx) = mpsc::channel(32);
+
+                let pb = ProgressBar::new(num_blocks as u64);
+                pb.set_style(
+                    ProgressStyle::default_bar()
+                        .template(
+                            "{spinner:.green} [{bar:40}] {pos}/{len} blocks ({msg})",
+                        )
+                        .unwrap(),
+                );
+
+                // Scope the future so it drops before we access state mutably
+                let result = {
+                    let store_fut =
+                        state.node.store_with_progress(&data, progress_tx);
+                    tokio::pin!(store_fut);
+                    loop {
+                        tokio::select! {
+                            Some(p) = progress_rx.recv() => {
+                                match p {
+                                    StoreProgress::Encoding { block, .. } =>
+                                        pb.set_message(format!("encoding {}", block + 1)),
+                                    StoreProgress::Distributing { block, .. } =>
+                                        pb.set_message(format!("distributing {}", block + 1)),
+                                    StoreProgress::BlockComplete { block, .. } =>
+                                        pb.set_position(block as u64 + 1),
+                                }
+                            }
+                            result = &mut store_fut => {
+                                pb.finish_and_clear();
+                                break result;
+                            }
+                        }
+                    }
+                };
+
+                match result {
+                    Ok(result) => {
+                        eprintln!(
+                            "store succeeded in {:.1}s",
+                            store_start.elapsed().as_secs_f64()
+                        );
+                        let token = result.to_string();
+                        println!("{token}");
+                        state.save_token(token, alias.as_deref());
+                    }
+                    Err(e) => eprintln!(
+                        "error: {e} (after {:.1}s)",
+                        store_start.elapsed().as_secs_f64()
+                    ),
                 }
-                Ok(Err(e)) => eprintln!("error: {e}"),
-                Err(_) => eprintln!("error: store timed out"),
+            } else {
+                // Simple store (inline content or small files)
+                match tokio::time::timeout(timeout, state.node.store(&data))
+                    .await
+                {
+                    Ok(Ok(result)) => {
+                        eprintln!(
+                            "store succeeded in {:.1}s",
+                            store_start.elapsed().as_secs_f64()
+                        );
+                        let token = result.to_string();
+                        println!("{token}");
+                        state.save_token(token, alias.as_deref());
+                    }
+                    Ok(Err(e)) => eprintln!(
+                        "error: {e} (after {:.1}s)",
+                        store_start.elapsed().as_secs_f64()
+                    ),
+                    Err(_) => eprintln!(
+                        "error: store timed out (after {:.1}s)",
+                        store_start.elapsed().as_secs_f64()
+                    ),
+                }
             }
         }
 
         "get" => {
             if arg.is_empty() {
-                println!("usage: get <token|index|alias>");
+                println!(
+                    "usage: get [--file <token|index|alias> <output>] | <token|index|alias>"
+                );
                 return Ok(true);
             }
-            let token_str =
-                if let Some((_, entry)) = resolve_token(&state.entries, arg) {
+
+            // Check for --file flag
+            if let Some(rest) = arg.strip_prefix("--file ") {
+                let rest = rest.trim();
+                let (token_arg, output_path) =
+                    rest.rsplit_once(' ').ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "usage: get --file <token|index|alias> <output>"
+                        )
+                    })?;
+                let token_str = if let Some((_, entry)) =
+                    resolve_token(&state.entries, token_arg)
+                {
+                    entry.token.clone()
+                } else {
+                    token_arg.to_string()
+                };
+                let parsed: StoreTesseraResult = token_str
+                    .parse()
+                    .map_err(|e| anyhow::anyhow!("invalid token: {e}"))?;
+                let timeout = retrieve_timeout(parsed.chunk_hashes.len());
+                let num_chunks = parsed.chunk_hashes.len();
+                eprintln!(
+                    "retrieving {} chunks (timeout={}s)...",
+                    num_chunks,
+                    timeout.as_secs()
+                );
+
+                let (progress_tx, mut progress_rx) = mpsc::channel(32);
+                let pb = ProgressBar::new(num_chunks as u64);
+                pb.set_style(
+                    ProgressStyle::default_bar()
+                        .template(
+                            "{spinner:.green} [{bar:40}] {pos}/{len} chunks ({msg})",
+                        )
+                        .unwrap(),
+                );
+
+                let retrieve_result = {
+                    let retrieve_fut =
+                        state.node.retrieve_with_progress(&parsed, progress_tx);
+                    let timed_fut = tokio::time::timeout(timeout, retrieve_fut);
+                    tokio::pin!(timed_fut);
+                    loop {
+                        tokio::select! {
+                            Some(p) = progress_rx.recv() => {
+                                match p {
+                                    RetrieveProgress::Fetching { chunk, .. } =>
+                                        pb.set_message(format!("fetching {}", chunk + 1)),
+                                    RetrieveProgress::ChunkComplete { chunk, .. } =>
+                                        pb.set_position(chunk as u64 + 1),
+                                }
+                            }
+                            result = &mut timed_fut => {
+                                pb.finish_and_clear();
+                                break result;
+                            }
+                        }
+                    }
+                };
+
+                match retrieve_result {
+                    Ok(Ok(data)) => {
+                        tokio::fs::write(output_path, &data).await?;
+                        eprintln!(
+                            "wrote {} bytes to {}",
+                            data.len(),
+                            output_path
+                        );
+                        state.save_token(token_str, None);
+                    }
+                    Ok(Err(e)) => eprintln!("error: {e}"),
+                    Err(_) => eprintln!("error: retrieve timed out"),
+                }
+            } else {
+                let token_str = if let Some((_, entry)) =
+                    resolve_token(&state.entries, arg)
+                {
                     entry.token.clone()
                 } else {
                     arg.to_string()
                 };
-            let result: StoreTesseraResult = token_str
-                .parse()
-                .map_err(|e| anyhow::anyhow!("invalid token: {e}"))?;
-            match tokio::time::timeout(
-                DHT_TIMEOUT,
-                state.node.retrieve(&result),
-            )
-            .await
-            {
-                Ok(Ok(data)) => {
-                    let content = String::from_utf8_lossy(&data);
-                    println!("{content}");
-                    state.save_token(token_str, None);
+                let parsed: StoreTesseraResult = token_str
+                    .parse()
+                    .map_err(|e| anyhow::anyhow!("invalid token: {e}"))?;
+                let timeout = retrieve_timeout(parsed.chunk_hashes.len());
+                match tokio::time::timeout(
+                    timeout,
+                    state.node.retrieve(&parsed),
+                )
+                .await
+                {
+                    Ok(Ok(data)) => {
+                        let content = String::from_utf8_lossy(&data);
+                        println!("{content}");
+                        state.save_token(token_str, None);
+                    }
+                    Ok(Err(e)) => eprintln!("error: {e}"),
+                    Err(_) => eprintln!("error: retrieve timed out"),
                 }
-                Ok(Err(e)) => eprintln!("error: {e}"),
-                Err(_) => eprintln!("error: retrieve timed out"),
             }
         }
 
@@ -958,9 +1191,11 @@ async fn handle_command(state: &mut ReplState, line: &str) -> Result<bool> {
         }
 
         "help" | "?" => {
-            println!("  put [--name <alias>] <content>");
-            println!("               Store content in the DHT");
-            println!("  get <token|index|alias>");
+            println!("  put [--name <alias>] [--file <path> | <content>]");
+            println!("               Store content or file in the DHT");
+            println!(
+                "  get [--file <token|index|alias> <output>] | <token|index|alias>"
+            );
             println!(
                 "               Retrieve content by token, index, or alias"
             );
@@ -1049,7 +1284,13 @@ async fn main() -> Result<()> {
     let opts = parse_args()?;
 
     // Data directories
-    let base = data_dir()?;
+    let base = match opts.data_dir {
+        Some(ref d) => {
+            fs::create_dir_all(d)?;
+            d.clone()
+        }
+        None => data_dir()?,
+    };
     let hashes_path = base.join("hash.txt");
     let db_path = base.join("tokens.db");
     let history_path = base.join("history.txt");
@@ -1064,28 +1305,61 @@ async fn main() -> Result<()> {
     }
 
     // Build node
-    let mut builder = NodeBuilder::new(&node_data_dir);
+    let mut builder = NodeBuilder::new(&node_data_dir)
+        .bootstrap(BootstrapSource::Dns("tesseras.net".into()))
+        .on_spawn_progress(|step| match step {
+            SpawnProgress::LoadingIdentity => {
+                eprintln!("Loading identity...");
+            }
+            SpawnProgress::GeneratingPow => {
+                eprintln!("Generating proof-of-work (first run)...");
+            }
+            SpawnProgress::BindingTransport { addr } => {
+                eprintln!("Binding to {addr}...");
+            }
+            SpawnProgress::SpawningNode => {
+                eprintln!("Spawning node...");
+            }
+            SpawnProgress::ResolvingBootstrap { ref domain } => {
+                eprintln!("Resolving bootstrap ({domain})...");
+            }
+            SpawnProgress::ConnectingBootstrap { count } => {
+                eprintln!(
+                    "Connecting to {count} bootstrap peer{}...",
+                    if count == 1 { "" } else { "s" }
+                );
+            }
+            SpawnProgress::StartingMdns => {
+                eprintln!("Starting mDNS discovery...");
+            }
+        });
 
-    // Apply bind address from CLI flags
+    // Apply bind address from CLI flags.
+    // Default: [::]:4433 (dual-stack). -4: 0.0.0.0:port. -6: [::]:port.
     if let Some(addr) = opts.bind_addr {
         builder = builder.bind(addr);
-    } else if opts.ipv4_only {
-        builder = builder.bind("0.0.0.0:0".parse().unwrap());
-    } else if opts.ipv6_only {
-        builder = builder.bind("[::]:0".parse().unwrap());
+    } else {
+        let ip: IpAddr = if opts.ipv4_only {
+            "0.0.0.0".parse().unwrap()
+        } else {
+            "::".parse().unwrap()
+        };
+        builder = builder.bind(SocketAddr::new(ip, opts.port));
     }
 
-    // Spawn the DHT node (generates identity + PoW on first run)
-    let first_run = !node_data_dir.join("metadata.db").exists();
-    if first_run {
-        eprintln!(
-            "Starting node \
-             (first run may take a moment for PoW generation)..."
-        );
-    } else {
-        eprintln!("Starting node...");
-    }
     let node = builder.spawn().await?;
+    eprintln!(
+        "Node spawned: node_id={} local_addr={}",
+        node.node_id(),
+        node.local_addr()
+    );
+    if let Some(ext) = node.external_addr().await {
+        eprintln!("External address (from bootstrap): {}", ext);
+    } else {
+        eprintln!(
+            "External address: not yet discovered (no bootstrap response?)"
+        );
+    }
 
     // Read public key from persisted identity
     let public_key_hex = {
